@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
+mlruns/
+mlartifacts/
+models/churn_model/
+models/*.json
+reports/*.csv
+reports/*.json
+data/*.csv
+.DS_Store

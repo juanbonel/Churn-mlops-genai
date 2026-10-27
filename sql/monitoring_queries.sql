@@ -1,0 +1,29 @@
+-- Example SQL contract for future production monitoring.
+-- This query becomes useful after storing prediction events in a managed Delta table.
+-- It is intentionally a template: the local demo currently writes JSON/CSV reports.
+
+-- CREATE TABLE IF NOT EXISTS main.mlops_demo.prediction_events (
+--   event_ts TIMESTAMP,
+--   model_name STRING,
+--   model_version STRING,
+--   prediction INT,
+--   churn_probability DOUBLE,
+--   tenure_months INT,
+--   monthly_charges DOUBLE,
+--   support_tickets_90d INT,
+--   usage_gb DOUBLE,
+--   payment_failures_90d INT,
+--   autopay INT,
+--   satisfaction_score INT,
+--   contract_type STRING
+-- ) USING DELTA;
+
+-- Example daily score volume and average model output:
+-- SELECT date_trunc('DAY', event_ts) AS day,
+--        model_name,
+--        model_version,
+--        count(*) AS predictions,
+--        avg(churn_probability) AS mean_churn_probability
+-- FROM main.mlops_demo.prediction_events
+-- GROUP BY 1, 2, 3
+-- ORDER BY 1 DESC;

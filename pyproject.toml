@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "churn-mlops-genai"
+version = "0.1.0"
+description = "Reproducible end-to-end MLOps and GenAI portfolio project"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "mlflow==2.22.2",
+  "SQLAlchemy>=2.0,<2.1",
+  "scikit-learn==1.6.1",
+  "pandas==2.2.3",
+  "numpy==2.2.4",
+  "fastapi==0.115.12",
+  "uvicorn[standard]==0.34.0",
+  "pydantic==2.11.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5", "httpx==0.28.1"]
+genai = ["openai==1.76.0"]
+mcp = ["mcp[cli]>=1.28.0,<2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
