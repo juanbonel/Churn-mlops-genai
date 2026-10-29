@@ -1,0 +1,460 @@
+-- Databricks notebook source
+-- MAGIC %md
+-- MAGIC Probar acceso a un LLM
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC LLM_MODEL = "system.ai.meta-llama-3-3-70b-instruct"
+-- MAGIC
+-- MAGIC try:
+-- MAGIC     test = spark.sql(f"""
+-- MAGIC         SELECT ai_query(
+-- MAGIC             '{LLM_MODEL}',
+-- MAGIC             'Respond exactly with: LLM_OK',
+-- MAGIC             modelParameters => named_struct(
+-- MAGIC                 'max_tokens', 30,
+-- MAGIC                 'temperature', 0.0
+-- MAGIC             )
+-- MAGIC         ) AS response
+-- MAGIC     """).first()["response"]
+-- MAGIC
+-- MAGIC     print("LLM disponible.")
+-- MAGIC     print("Respuesta:", test)
+-- MAGIC
+-- MAGIC except Exception as e:
+-- MAGIC     print("No se pudo consultar el modelo:")
+-- MAGIC     print(str(e)[:2000])
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Crear la base de conocimiento del RAG: Esta primera versión incluye documentación resumida del proyecto que ya desarrollaste. Más adelante podemos reemplazarla por una ingesta automática del README y de los documentos del repositorio.
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from sklearn.feature_extraction.text import TfidfVectorizer
+-- MAGIC from sklearn.metrics.pairwise import cosine_similarity
+-- MAGIC import numpy as np
+-- MAGIC
+-- MAGIC documents = [
+-- MAGIC     {
+-- MAGIC         "source": "Arquitectura del proyecto",
+-- MAGIC         "text": """
+-- MAGIC         Proyecto de portfolio de MLOps para predecir abandono de clientes
+-- MAGIC         customer churn. Incluye entrenamiento de modelos con Python y
+-- MAGIC         scikit-learn, seguimiento de experimentos con MLflow, registro
+-- MAGIC         del modelo en Unity Catalog, serving administrado, monitoreo
+-- MAGIC         de drift y automatización mediante GitHub Actions.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC     {
+-- MAGIC         "source": "Entrenamiento y MLflow",
+-- MAGIC         "text": """
+-- MAGIC         Se comparan Regresión Logística y Random Forest. Las métricas
+-- MAGIC         principales son ROC-AUC, F1 y accuracy. MLflow registra los
+-- MAGIC         parámetros, métricas, ejecuciones y artefactos de los modelos.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC     {
+-- MAGIC         "source": "Modelo registrado",
+-- MAGIC         "text": """
+-- MAGIC         Nombre completo del modelo: workspace.default.subscription_churn_model.
+-- MAGIC         La versión 1 está registrada en Unity Catalog y se verificó
+-- MAGIC         que puede cargarse para inferencia desde una notebook Databricks.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC     {
+-- MAGIC         "source": "Serving",
+-- MAGIC         "text": """
+-- MAGIC         El endpoint de predicción se llama churn-serving-endpoint.
+-- MAGIC         Se creó en Databricks Model Serving y se verificó que está Ready.
+-- MAGIC         Una consulta de prueba devolvió predictions con valor 1.
+-- MAGIC         El modelo utiliza datos sintéticos y no está validado para
+-- MAGIC         decisiones reales sobre clientes.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC     {
+-- MAGIC         "source": "Monitoreo de drift",
+-- MAGIC         "text": """
+-- MAGIC         Los reportes se guardan en la tabla Delta
+-- MAGIC         workspace.default.churn_drift_reports. El monitor calcula
+-- MAGIC         Population Stability Index o PSI por variable. El umbral
+-- MAGIC         configurado es 0.20. drift_detected indica si una variable
+-- MAGIC         supera ese umbral. Los datos actuales de la demostración
+-- MAGIC         son sintéticos y no representan necesariamente el tráfico real.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC     {
+-- MAGIC         "source": "Reentrenamiento controlado",
+-- MAGIC         "text": """
+-- MAGIC         La notebook 03_retraining_gate compara candidatos con la
+-- MAGIC         versión 1 registrada. La promoción requiere una mejora mínima
+-- MAGIC         de ROC-AUC de 0.005 y una caída máxima de F1 de 0.02.
+-- MAGIC         El candidato evaluado fue rechazado porque no cumplió los
+-- MAGIC         criterios. El endpoint existente no fue modificado.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC     {
+-- MAGIC         "source": "Limitaciones y evaluación",
+-- MAGIC         "text": """
+-- MAGIC         El proyecto usa datos sintéticos para demostrar el pipeline.
+-- MAGIC         La detección de drift no demuestra degradación de precisión.
+-- MAGIC         Para medir rendimiento real se necesitan etiquetas observadas.
+-- MAGIC         No debe presentarse como un despliegue productivo para clientes.
+-- MAGIC         """
+-- MAGIC     },
+-- MAGIC ]
+-- MAGIC
+-- MAGIC # Indexación TF-IDF para recuperar los documentos más relevantes.
+-- MAGIC # Es una primera implementación de recuperación léxica, sin una
+-- MAGIC # base vectorial externa ni un servicio de embeddings.
+-- MAGIC
+-- MAGIC vectorizer = TfidfVectorizer(
+-- MAGIC     lowercase=True,
+-- MAGIC     strip_accents="unicode",
+-- MAGIC     ngram_range=(1, 2),
+-- MAGIC )
+-- MAGIC
+-- MAGIC corpus_matrix = vectorizer.fit_transform(
+-- MAGIC     [doc["text"] for doc in documents]
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC def retrieve_docs(query, k=3):
+-- MAGIC     query_vector = vectorizer.transform([query])
+-- MAGIC
+-- MAGIC     scores = cosine_similarity(
+-- MAGIC         query_vector,
+-- MAGIC         corpus_matrix
+-- MAGIC     ).flatten()
+-- MAGIC
+-- MAGIC     indexes = np.argsort(scores)[::-1][:k]
+-- MAGIC
+-- MAGIC     return [
+-- MAGIC         {
+-- MAGIC             "source": documents[i]["source"],
+-- MAGIC             "text": documents[i]["text"].strip(),
+-- MAGIC             "score": round(float(scores[i]), 4),
+-- MAGIC         }
+-- MAGIC         for i in indexes
+-- MAGIC     ]
+-- MAGIC
+-- MAGIC
+-- MAGIC # Prueba de recuperación
+-- MAGIC for item in retrieve_docs(
+-- MAGIC     "¿Cómo funciona el monitoreo de drift y dónde se guardan los resultados?"
+-- MAGIC ):
+-- MAGIC     print(item["source"], "| score:", item["score"])
+-- MAGIC     print(item["text"], "\n")
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Crear las herramientas del agente
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from datetime import datetime
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC from mlflow.tracking import MlflowClient
+-- MAGIC
+-- MAGIC MODEL_NAME = "workspace.default.subscription_churn_model"
+-- MAGIC DRIFT_TABLE = "workspace.default.churn_drift_reports"
+-- MAGIC ENDPOINT_NAME = "churn-serving-endpoint"
+-- MAGIC
+-- MAGIC
+-- MAGIC def get_drift_summary():
+-- MAGIC     """Consulta el último reporte de drift almacenado en Delta."""
+-- MAGIC     df = spark.table(DRIFT_TABLE)
+-- MAGIC
+-- MAGIC     timestamps = [
+-- MAGIC         row["monitor_run_ts"]
+-- MAGIC         for row in df.select("monitor_run_ts").distinct().collect()
+-- MAGIC     ]
+-- MAGIC
+-- MAGIC     if not timestamps:
+-- MAGIC         return {"error": "No existen reportes de drift."}
+-- MAGIC
+-- MAGIC     latest_ts = max(
+-- MAGIC         timestamps,
+-- MAGIC         key=lambda value: datetime.fromisoformat(value)
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     latest = (
+-- MAGIC         df.filter(F.col("monitor_run_ts") == latest_ts)
+-- MAGIC         .select(
+-- MAGIC             "feature", "psi", "threshold", "drift_detected"
+-- MAGIC         )
+-- MAGIC         .toPandas()
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     drifted = latest[latest["drift_detected"] == True]
+-- MAGIC
+-- MAGIC     return {
+-- MAGIC         "table": DRIFT_TABLE,
+-- MAGIC         "monitor_run_ts": latest_ts,
+-- MAGIC         "features_analyzed": len(latest),
+-- MAGIC         "features_with_drift": len(drifted),
+-- MAGIC         "max_psi": float(latest["psi"].max()),
+-- MAGIC         "affected_features": drifted["feature"].tolist(),
+-- MAGIC         "synthetic_data": True,
+-- MAGIC     }
+-- MAGIC
+-- MAGIC
+-- MAGIC def get_model_status():
+-- MAGIC     """Consulta las versiones registradas en Unity Catalog."""
+-- MAGIC     client = MlflowClient(registry_uri="databricks-uc")
+-- MAGIC
+-- MAGIC     versions = list(
+-- MAGIC         client.search_model_versions(f"name='{MODEL_NAME}'")
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     return {
+-- MAGIC         "model_name": MODEL_NAME,
+-- MAGIC         "versions": [
+-- MAGIC             {
+-- MAGIC                 "version": str(v.version),
+-- MAGIC                 "status": v.status,
+-- MAGIC             }
+-- MAGIC             for v in versions
+-- MAGIC         ],
+-- MAGIC     }
+-- MAGIC
+-- MAGIC
+-- MAGIC def predict_sample_customer():
+-- MAGIC     """Consulta el endpoint con un cliente sintético de ejemplo."""
+-- MAGIC     from databricks.sdk import WorkspaceClient
+-- MAGIC
+-- MAGIC     sample = {
+-- MAGIC         "tenure_months": 12,
+-- MAGIC         "monthly_charges": 85.5,
+-- MAGIC         "support_tickets_90d": 2,
+-- MAGIC         "usage_gb": 150.0,
+-- MAGIC         "payment_failures_90d": 1,
+-- MAGIC         "autopay": 0,
+-- MAGIC         "satisfaction_score": 3,
+-- MAGIC         "contract_type": "monthly",
+-- MAGIC     }
+-- MAGIC
+-- MAGIC     client = WorkspaceClient()
+-- MAGIC
+-- MAGIC     response = client.serving_endpoints.query(
+-- MAGIC         name=ENDPOINT_NAME,
+-- MAGIC         dataframe_records=[sample],
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     if hasattr(response, "as_dict"):
+-- MAGIC         response_data = response.as_dict()
+-- MAGIC     elif hasattr(response, "predictions"):
+-- MAGIC         response_data = {"predictions": response.predictions}
+-- MAGIC     else:
+-- MAGIC         response_data = str(response)
+-- MAGIC
+-- MAGIC     return {
+-- MAGIC         "endpoint": ENDPOINT_NAME,
+-- MAGIC         "input_type": "synthetic_sample",
+-- MAGIC         "response": response_data,
+-- MAGIC     }
+-- MAGIC
+-- MAGIC
+-- MAGIC # Comprobá las dos herramientas de consulta antes de usar el agente.
+-- MAGIC print("Drift:")
+-- MAGIC print(get_drift_summary())
+-- MAGIC
+-- MAGIC print("\nModelo:")
+-- MAGIC print(get_model_status())
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Implementar el agente con RAG y tools
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC import json
+-- MAGIC import re
+-- MAGIC
+-- MAGIC ALLOWED_ACTIONS = {
+-- MAGIC     "retrieve_docs",
+-- MAGIC     "get_drift_summary",
+-- MAGIC     "get_model_status",
+-- MAGIC     "predict_sample_customer",
+-- MAGIC }
+-- MAGIC
+-- MAGIC
+-- MAGIC def call_llm(prompt, max_tokens=450):
+-- MAGIC     """Consulta el modelo generativo mediante ai_query."""
+-- MAGIC     prompt_df = spark.createDataFrame(
+-- MAGIC         [(prompt,)],
+-- MAGIC         ["prompt"],
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     prompt_df.createOrReplaceTempView("churn_agent_prompt")
+-- MAGIC
+-- MAGIC     row = spark.sql(f"""
+-- MAGIC         SELECT ai_query(
+-- MAGIC             '{LLM_MODEL}',
+-- MAGIC             prompt,
+-- MAGIC             modelParameters => named_struct(
+-- MAGIC                 'max_tokens', {int(max_tokens)},
+-- MAGIC                 'temperature', 0.0
+-- MAGIC             )
+-- MAGIC         ) AS response
+-- MAGIC         FROM churn_agent_prompt
+-- MAGIC     """).first()
+-- MAGIC
+-- MAGIC     return str(row["response"])
+-- MAGIC
+-- MAGIC
+-- MAGIC def fallback_action(question):
+-- MAGIC     """Alternativa conservadora si el LLM no puede planificar."""
+-- MAGIC     q = question.lower()
+-- MAGIC
+-- MAGIC     if any(word in q for word in ["drift", "psi", "desvío", "desvio"]):
+-- MAGIC         return "get_drift_summary"
+-- MAGIC
+-- MAGIC     if any(word in q for word in ["versión", "version", "registro", "ready"]):
+-- MAGIC         return "get_model_status"
+-- MAGIC
+-- MAGIC     if any(word in q for word in ["predicción", "predecir", "predict", "abandono"]):
+-- MAGIC         return "predict_sample_customer"
+-- MAGIC
+-- MAGIC     return "retrieve_docs"
+-- MAGIC
+-- MAGIC
+-- MAGIC def choose_action(question):
+-- MAGIC     """El LLM elige entre herramientas previamente autorizadas."""
+-- MAGIC     prompt = f"""
+-- MAGIC Sos el planificador de herramientas de un asistente técnico de MLOps.
+-- MAGIC
+-- MAGIC Elegí exactamente una acción:
+-- MAGIC - retrieve_docs: preguntas sobre documentación o arquitectura.
+-- MAGIC - get_drift_summary: preguntas sobre drift, PSI o el último reporte.
+-- MAGIC - get_model_status: preguntas sobre versiones registradas del modelo.
+-- MAGIC - predict_sample_customer: solicitud explícita de probar el endpoint
+-- MAGIC   con el cliente sintético de ejemplo.
+-- MAGIC
+-- MAGIC No inventes herramientas ni argumentos.
+-- MAGIC Devolvé solamente JSON válido, por ejemplo:
+-- MAGIC {{"action": "get_drift_summary"}}
+-- MAGIC
+-- MAGIC Pregunta del usuario:
+-- MAGIC {question}
+-- MAGIC """
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC         raw = call_llm(prompt, max_tokens=100)
+-- MAGIC         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+-- MAGIC
+-- MAGIC         if match:
+-- MAGIC             action = json.loads(match.group(0)).get("action")
+-- MAGIC             if action in ALLOWED_ACTIONS:
+-- MAGIC                 return action
+-- MAGIC
+-- MAGIC     except Exception as exc:
+-- MAGIC         print("Planner LLM no disponible:", str(exc)[:300])
+-- MAGIC
+-- MAGIC     return fallback_action(question)
+-- MAGIC
+-- MAGIC
+-- MAGIC def answer_agent(question):
+-- MAGIC     # 1. Recuperar documentación relevante
+-- MAGIC     retrieved = retrieve_docs(question, k=3)
+-- MAGIC
+-- MAGIC     # 2. Elegir y ejecutar una herramienta
+-- MAGIC     action = choose_action(question)
+-- MAGIC
+-- MAGIC     if action == "get_drift_summary":
+-- MAGIC         tool_result = get_drift_summary()
+-- MAGIC     elif action == "get_model_status":
+-- MAGIC         tool_result = get_model_status()
+-- MAGIC     elif action == "predict_sample_customer":
+-- MAGIC         tool_result = predict_sample_customer()
+-- MAGIC     else:
+-- MAGIC         tool_result = {
+-- MAGIC             "tool": "retrieve_docs",
+-- MAGIC             "documents": retrieved,
+-- MAGIC         }
+-- MAGIC
+-- MAGIC     # 3. Construir una respuesta apoyada en la evidencia recuperada
+-- MAGIC     context = "\n\n".join(
+-- MAGIC         f"Fuente: {doc['source']}\n{doc['text']}"
+-- MAGIC         for doc in retrieved
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     final_prompt = f"""
+-- MAGIC Sos un asistente técnico del proyecto de portfolio MLOps.
+-- MAGIC
+-- MAGIC Respondé en español de manera clara y concreta.
+-- MAGIC Usá la documentación recuperada y el resultado de la herramienta.
+-- MAGIC No inventes valores, estados ni funcionalidades.
+-- MAGIC Si los datos son sintéticos, aclaralo.
+-- MAGIC Diferenciá drift de datos de degradación de rendimiento.
+-- MAGIC Si falta información, decilo explícitamente.
+-- MAGIC
+-- MAGIC Pregunta:
+-- MAGIC {question}
+-- MAGIC
+-- MAGIC Documentación recuperada:
+-- MAGIC {context}
+-- MAGIC
+-- MAGIC Acción ejecutada:
+-- MAGIC {action}
+-- MAGIC
+-- MAGIC Resultado de la herramienta:
+-- MAGIC {json.dumps(tool_result, ensure_ascii=False, default=str)}
+-- MAGIC
+-- MAGIC Redactá la respuesta final para el usuario.
+-- MAGIC """
+-- MAGIC
+-- MAGIC     final_answer = call_llm(final_prompt, max_tokens=450)
+-- MAGIC
+-- MAGIC     return {
+-- MAGIC         "question": question,
+-- MAGIC         "action": action,
+-- MAGIC         "retrieved_sources": [doc["source"] for doc in retrieved],
+-- MAGIC         "tool_result": tool_result,
+-- MAGIC         "answer": final_answer,
+-- MAGIC     }
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Probar el agente
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC result = answer_agent(
+-- MAGIC     "¿Cuál fue el último reporte de drift, cuántas variables "
+-- MAGIC     "superaron el umbral y cuáles fueron?"
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("Acción elegida:", result["action"])
+-- MAGIC print("Fuentes recuperadas:", result["retrieved_sources"])
+-- MAGIC print("\nRespuesta del agente:")
+-- MAGIC print(result["answer"])
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Consultas
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC answer_agent("¿Qué versión del modelo está registrada en Unity Catalog?")
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC answer_agent("Probá el endpoint con el cliente sintético de ejemplo.")
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC answer_agent("Explicame la arquitectura MLOps de este proyecto.")

@@ -1,0 +1,318 @@
+-- Databricks notebook source
+-- MAGIC %md
+-- MAGIC ##Agregar el monitor independiente
+-- MAGIC Esta versión genera poblaciones sintéticas de referencia y actuales, calcula PSI, y agrega los resultados a la tabla Delta que ya creaste.
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC import numpy as np
+-- MAGIC import pandas as pd
+-- MAGIC
+-- MAGIC from datetime import datetime, timezone
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC # --------------------------------------------------
+-- MAGIC # 1. Configuración
+-- MAGIC # --------------------------------------------------
+-- MAGIC
+-- MAGIC TABLE_NAME = "workspace.default.churn_drift_reports"
+-- MAGIC PSI_THRESHOLD = 0.20
+-- MAGIC
+-- MAGIC run_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+-- MAGIC
+-- MAGIC # Semilla diaria para obtener resultados reproducibles
+-- MAGIC # durante el mismo día, con nuevas muestras en días distintos.
+-- MAGIC daily_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d"))
+-- MAGIC
+-- MAGIC
+-- MAGIC # --------------------------------------------------
+-- MAGIC # 2. Generar datos sintéticos
+-- MAGIC # --------------------------------------------------
+-- MAGIC
+-- MAGIC def generate_population(n, seed, shifted=False):
+-- MAGIC     rng = np.random.default_rng(seed)
+-- MAGIC
+-- MAGIC     if shifted:
+-- MAGIC         tenure = rng.normal(15, 10, n)
+-- MAGIC         charges = rng.normal(92, 22, n)
+-- MAGIC         tickets = rng.poisson(3.0, n)
+-- MAGIC         usage = rng.normal(160, 50, n)
+-- MAGIC         failures = rng.poisson(0.55, n)
+-- MAGIC         satisfaction = rng.normal(3.0, 1.0, n)
+-- MAGIC         contract_probs = [0.80, 0.15, 0.05]
+-- MAGIC     else:
+-- MAGIC         tenure = rng.normal(24, 15, n)
+-- MAGIC         charges = rng.normal(75, 20, n)
+-- MAGIC         tickets = rng.poisson(1.2, n)
+-- MAGIC         usage = rng.normal(120, 45, n)
+-- MAGIC         failures = rng.poisson(0.35, n)
+-- MAGIC         satisfaction = rng.normal(3.5, 0.9, n)
+-- MAGIC         contract_probs = [0.55, 0.30, 0.15]
+-- MAGIC
+-- MAGIC     return pd.DataFrame({
+-- MAGIC         "tenure_months": np.clip(
+-- MAGIC             np.rint(tenure), 1, 72
+-- MAGIC         ).astype(int),
+-- MAGIC         "monthly_charges": np.round(
+-- MAGIC             np.clip(charges, 20, 150), 2
+-- MAGIC         ),
+-- MAGIC         "support_tickets_90d": np.clip(
+-- MAGIC             tickets, 0, 10
+-- MAGIC         ).astype(int),
+-- MAGIC         "usage_gb": np.round(
+-- MAGIC             np.clip(usage, 0, 400), 2
+-- MAGIC         ),
+-- MAGIC         "payment_failures_90d": np.clip(
+-- MAGIC             failures, 0, 6
+-- MAGIC         ).astype(int),
+-- MAGIC         "autopay": rng.binomial(1, 0.58, n),
+-- MAGIC         "satisfaction_score": np.clip(
+-- MAGIC             np.rint(satisfaction), 1, 5
+-- MAGIC         ).astype(int),
+-- MAGIC         "contract_type": rng.choice(
+-- MAGIC             ["monthly", "annual", "two_year"],
+-- MAGIC             size=n,
+-- MAGIC             p=contract_probs
+-- MAGIC         )
+-- MAGIC     })
+-- MAGIC
+-- MAGIC
+-- MAGIC reference = generate_population(
+-- MAGIC     n=1200, seed=42, shifted=False
+-- MAGIC )
+-- MAGIC
+-- MAGIC current = generate_population(
+-- MAGIC     n=1000, seed=daily_seed, shifted=True
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("Reference rows:", len(reference))
+-- MAGIC print("Current rows:", len(current))
+-- MAGIC
+-- MAGIC
+-- MAGIC # --------------------------------------------------
+-- MAGIC # 3. Calcular Population Stability Index (PSI)
+-- MAGIC # --------------------------------------------------
+-- MAGIC
+-- MAGIC def calculate_numeric_psi(reference_values, current_values):
+-- MAGIC     ref = np.asarray(reference_values, dtype=float)
+-- MAGIC     cur = np.asarray(current_values, dtype=float)
+-- MAGIC
+-- MAGIC     quantiles = np.unique(
+-- MAGIC         np.quantile(ref, np.linspace(0, 1, 11))
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     edges = np.concatenate((
+-- MAGIC         [-np.inf],
+-- MAGIC         quantiles[1:-1],
+-- MAGIC         [np.inf]
+-- MAGIC     ))
+-- MAGIC
+-- MAGIC     ref_counts, _ = np.histogram(ref, bins=edges)
+-- MAGIC     cur_counts, _ = np.histogram(cur, bins=edges)
+-- MAGIC
+-- MAGIC     eps = 1e-6
+-- MAGIC
+-- MAGIC     p = (ref_counts + eps) / (
+-- MAGIC         ref_counts.sum() + eps * len(ref_counts)
+-- MAGIC     )
+-- MAGIC     q = (cur_counts + eps) / (
+-- MAGIC         cur_counts.sum() + eps * len(cur_counts)
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     return float(np.sum((q - p) * np.log(q / p)))
+-- MAGIC
+-- MAGIC
+-- MAGIC def calculate_categorical_psi(reference_values, current_values):
+-- MAGIC     ref = pd.Series(reference_values).astype(str)
+-- MAGIC     cur = pd.Series(current_values).astype(str)
+-- MAGIC
+-- MAGIC     categories = sorted(
+-- MAGIC         set(ref.unique()) | set(cur.unique())
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     ref_counts = (
+-- MAGIC         ref.value_counts()
+-- MAGIC         .reindex(categories, fill_value=0)
+-- MAGIC         .to_numpy(dtype=float)
+-- MAGIC     )
+-- MAGIC     cur_counts = (
+-- MAGIC         cur.value_counts()
+-- MAGIC         .reindex(categories, fill_value=0)
+-- MAGIC         .to_numpy(dtype=float)
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     eps = 1e-6
+-- MAGIC
+-- MAGIC     p = (ref_counts + eps) / (
+-- MAGIC         ref_counts.sum() + eps * len(ref_counts)
+-- MAGIC     )
+-- MAGIC     q = (cur_counts + eps) / (
+-- MAGIC         cur_counts.sum() + eps * len(cur_counts)
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     return float(np.sum((q - p) * np.log(q / p)))
+-- MAGIC
+-- MAGIC
+-- MAGIC numeric_features = [
+-- MAGIC     "tenure_months",
+-- MAGIC     "monthly_charges",
+-- MAGIC     "support_tickets_90d",
+-- MAGIC     "usage_gb",
+-- MAGIC     "payment_failures_90d",
+-- MAGIC     "satisfaction_score",
+-- MAGIC ]
+-- MAGIC
+-- MAGIC categorical_features = [
+-- MAGIC     "contract_type",
+-- MAGIC     "autopay",
+-- MAGIC ]
+-- MAGIC
+-- MAGIC rows = []
+-- MAGIC
+-- MAGIC for feature in numeric_features:
+-- MAGIC     psi = calculate_numeric_psi(
+-- MAGIC         reference[feature],
+-- MAGIC         current[feature]
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     rows.append({
+-- MAGIC         "feature": feature,
+-- MAGIC         "psi": psi,
+-- MAGIC         "threshold": PSI_THRESHOLD,
+-- MAGIC         "drift_detected": bool(psi >= PSI_THRESHOLD),
+-- MAGIC         "reference_rows": len(reference),
+-- MAGIC         "current_rows": len(current),
+-- MAGIC         "monitor_run_ts": run_ts,
+-- MAGIC     })
+-- MAGIC
+-- MAGIC for feature in categorical_features:
+-- MAGIC     psi = calculate_categorical_psi(
+-- MAGIC         reference[feature],
+-- MAGIC         current[feature]
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     rows.append({
+-- MAGIC         "feature": feature,
+-- MAGIC         "psi": psi,
+-- MAGIC         "threshold": PSI_THRESHOLD,
+-- MAGIC         "drift_detected": bool(psi >= PSI_THRESHOLD),
+-- MAGIC         "reference_rows": len(reference),
+-- MAGIC         "current_rows": len(current),
+-- MAGIC         "monitor_run_ts": run_ts,
+-- MAGIC     })
+-- MAGIC
+-- MAGIC report = pd.DataFrame(rows).sort_values(
+-- MAGIC     "psi", ascending=False
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(report)
+-- MAGIC
+-- MAGIC
+-- MAGIC # --------------------------------------------------
+-- MAGIC # 4. Persistir el reporte en Delta
+-- MAGIC # --------------------------------------------------
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE TABLE IF NOT EXISTS workspace.default.churn_drift_reports (
+-- MAGIC     feature STRING,
+-- MAGIC     psi DOUBLE,
+-- MAGIC     threshold DOUBLE,
+-- MAGIC     drift_detected BOOLEAN,
+-- MAGIC     reference_rows BIGINT,
+-- MAGIC     current_rows BIGINT,
+-- MAGIC     monitor_run_ts STRING
+-- MAGIC )
+-- MAGIC USING DELTA
+-- MAGIC """)
+-- MAGIC
+-- MAGIC spark_report = spark.createDataFrame(report)
+-- MAGIC
+-- MAGIC (
+-- MAGIC     spark_report.write
+-- MAGIC     .format("delta")
+-- MAGIC     .mode("append")
+-- MAGIC     .saveAsTable(TABLE_NAME)
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(f"Reporte guardado en: {TABLE_NAME}")
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     spark.table(TABLE_NAME)
+-- MAGIC     .where(F.col("monitor_run_ts") == run_ts)
+-- MAGIC     .orderBy(F.desc("psi"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC table_name = "workspace.default.churn_drift_reports"
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     spark.table(table_name)
+-- MAGIC     .groupBy("monitor_run_ts")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("features"),
+-- MAGIC         F.sum(
+-- MAGIC             F.col("drift_detected").cast("int")
+-- MAGIC         ).alias("features_with_drift"),
+-- MAGIC         F.max("psi").alias("max_psi")
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("monitor_run_ts"))
+-- MAGIC     .limit(5)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC TABLE_NAME = "workspace.default.churn_drift_reports"
+-- MAGIC
+-- MAGIC # Revisar exclusivamente los resultados de esta ejecución
+-- MAGIC current_run = (
+-- MAGIC     spark.table(TABLE_NAME)
+-- MAGIC     .filter(F.col("monitor_run_ts") == run_ts)
+-- MAGIC )
+-- MAGIC
+-- MAGIC summary = current_run.agg(
+-- MAGIC     F.count("*").alias("features"),
+-- MAGIC     F.sum(
+-- MAGIC         F.col("drift_detected").cast("int")
+-- MAGIC     ).alias("features_with_drift"),
+-- MAGIC     F.max("psi").alias("max_psi")
+-- MAGIC ).first()
+-- MAGIC
+-- MAGIC features = summary["features"] or 0
+-- MAGIC features_with_drift = summary["features_with_drift"] or 0
+-- MAGIC max_psi = summary["max_psi"]
+-- MAGIC
+-- MAGIC # Regla demostrativa del proyecto, configurable:
+-- MAGIC # generar alerta si 3 o más variables superan el umbral PSI.
+-- MAGIC DRIFT_FEATURE_COUNT_THRESHOLD = 3
+-- MAGIC
+-- MAGIC if features == 0:
+-- MAGIC     raise RuntimeError(
+-- MAGIC         "No se encontraron resultados para esta ejecución."
+-- MAGIC     )
+-- MAGIC
+-- MAGIC status = (
+-- MAGIC     "DRIFT_DETECTED"
+-- MAGIC     if features_with_drift >= DRIFT_FEATURE_COUNT_THRESHOLD
+-- MAGIC     else "NO_DRIFT_ALERT"
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(f"Monitor status: {status}")
+-- MAGIC print(f"Features analyzed: {features}")
+-- MAGIC print(f"Features with drift: {features_with_drift}")
+-- MAGIC print(f"Maximum PSI: {max_psi:.4f}")
+-- MAGIC
+-- MAGIC if status == "DRIFT_DETECTED":
+-- MAGIC     print(
+-- MAGIC         "Action: review the affected features and evaluate "
+-- MAGIC         "whether retraining is justified."
+-- MAGIC     )
+-- MAGIC else:
+-- MAGIC     print("Action: continue monitoring.")

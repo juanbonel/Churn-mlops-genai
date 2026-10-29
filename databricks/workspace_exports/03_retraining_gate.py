@@ -1,0 +1,508 @@
+-- Databricks notebook source
+-- MAGIC %python
+-- MAGIC import numpy as np
+-- MAGIC import pandas as pd
+-- MAGIC import mlflow
+-- MAGIC import mlflow.sklearn
+-- MAGIC
+-- MAGIC from mlflow.models import infer_signature
+-- MAGIC from mlflow.tracking import MlflowClient
+-- MAGIC
+-- MAGIC from sklearn.compose import ColumnTransformer
+-- MAGIC from sklearn.ensemble import RandomForestClassifier
+-- MAGIC from sklearn.impute import SimpleImputer
+-- MAGIC from sklearn.linear_model import LogisticRegression
+-- MAGIC from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+-- MAGIC from sklearn.pipeline import Pipeline
+-- MAGIC from sklearn.preprocessing import OneHotEncoder, StandardScaler
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 1. Configuración
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC MODEL_NAME = "workspace.default.subscription_churn_model"
+-- MAGIC INCUMBENT_VERSION = "1"
+-- MAGIC
+-- MAGIC NUMERIC = [
+-- MAGIC     "tenure_months",
+-- MAGIC     "monthly_charges",
+-- MAGIC     "support_tickets_90d",
+-- MAGIC     "usage_gb",
+-- MAGIC     "payment_failures_90d",
+-- MAGIC     "autopay",
+-- MAGIC     "satisfaction_score",
+-- MAGIC ]
+-- MAGIC
+-- MAGIC CATEGORICAL = ["contract_type"]
+-- MAGIC FEATURES = NUMERIC + CATEGORICAL
+-- MAGIC TARGET = "churn"
+-- MAGIC
+-- MAGIC TRAIN_SEED = 2026
+-- MAGIC TEST_SEED = 2027
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 2. Generación reproducible de datos sintéticos
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC def make_data(n, seed, shifted=False):
+-- MAGIC     rng = np.random.default_rng(seed)
+-- MAGIC
+-- MAGIC     if shifted:
+-- MAGIC         # Distribución modificada para simular drift.
+-- MAGIC         tenure = np.clip(
+-- MAGIC             np.rint(rng.beta(1.6, 2.8, n) * 72 + 1),
+-- MAGIC             1, 72
+-- MAGIC         ).astype(int)
+-- MAGIC
+-- MAGIC         charges = np.clip(
+-- MAGIC             rng.normal(88, 22, n), 18, 150
+-- MAGIC         ).round(2)
+-- MAGIC
+-- MAGIC         tickets = rng.poisson(2.2, n)
+-- MAGIC
+-- MAGIC         usage = np.clip(
+-- MAGIC             rng.normal(125, 42, n), 1, 250
+-- MAGIC         ).round(2)
+-- MAGIC
+-- MAGIC         failures = rng.poisson(0.45, n)
+-- MAGIC
+-- MAGIC         satisfaction = rng.choice(
+-- MAGIC             [1, 2, 3, 4, 5],
+-- MAGIC             size=n,
+-- MAGIC             p=[0.15, 0.20, 0.30, 0.25, 0.10]
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         contract = rng.choice(
+-- MAGIC             ["monthly", "annual", "two_year"],
+-- MAGIC             n,
+-- MAGIC             p=[0.75, 0.18, 0.07]
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         autopay = rng.binomial(1, 0.45, n)
+-- MAGIC
+-- MAGIC     else:
+-- MAGIC         # Distribución original del proyecto.
+-- MAGIC         tenure = rng.integers(1, 73, n)
+-- MAGIC
+-- MAGIC         charges = np.clip(
+-- MAGIC             rng.normal(72, 20, n), 18, 150
+-- MAGIC         ).round(2)
+-- MAGIC
+-- MAGIC         tickets = rng.poisson(1.25, n)
+-- MAGIC
+-- MAGIC         usage = np.clip(
+-- MAGIC             rng.normal(95, 34, n), 1, 250
+-- MAGIC         ).round(2)
+-- MAGIC
+-- MAGIC         failures = rng.poisson(0.28, n)
+-- MAGIC
+-- MAGIC         satisfaction = rng.integers(1, 6, n)
+-- MAGIC
+-- MAGIC         contract = rng.choice(
+-- MAGIC             ["monthly", "annual", "two_year"],
+-- MAGIC             n,
+-- MAGIC             p=[0.55, 0.30, 0.15]
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         autopay = rng.binomial(1, 0.58, n)
+-- MAGIC
+-- MAGIC     # Se conserva la misma relación subyacente entre
+-- MAGIC     # las variables y el objetivo churn.
+-- MAGIC     logit = (
+-- MAGIC         -1.25
+-- MAGIC         + 0.032 * (charges - 70)
+-- MAGIC         - 0.035 * (tenure - 24)
+-- MAGIC         + 0.48 * tickets
+-- MAGIC         + 0.85 * failures
+-- MAGIC         + 0.78 * (contract == "monthly")
+-- MAGIC         - 0.42 * (contract == "annual")
+-- MAGIC         - 0.60 * autopay
+-- MAGIC         - 0.42 * (satisfaction - 3)
+-- MAGIC         - 0.004 * (usage - 90)
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     probability = 1 / (
+-- MAGIC         1 + np.exp(-np.clip(logit, -15, 15))
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     churn = rng.binomial(1, probability, n)
+-- MAGIC
+-- MAGIC     return pd.DataFrame({
+-- MAGIC         "tenure_months": tenure,
+-- MAGIC         "monthly_charges": charges,
+-- MAGIC         "support_tickets_90d": tickets,
+-- MAGIC         "usage_gb": usage,
+-- MAGIC         "payment_failures_90d": failures,
+-- MAGIC         "autopay": autopay,
+-- MAGIC         "satisfaction_score": satisfaction,
+-- MAGIC         "contract_type": contract,
+-- MAGIC         "churn": churn,
+-- MAGIC     })
+-- MAGIC
+-- MAGIC
+-- MAGIC # Entrenamiento y prueba tienen semillas independientes.
+-- MAGIC train_df = make_data(
+-- MAGIC     n=6000, seed=TRAIN_SEED, shifted=True
+-- MAGIC )
+-- MAGIC
+-- MAGIC test_df = make_data(
+-- MAGIC     n=2500, seed=TEST_SEED, shifted=True
+-- MAGIC )
+-- MAGIC
+-- MAGIC X_train = train_df[FEATURES]
+-- MAGIC y_train = train_df[TARGET]
+-- MAGIC
+-- MAGIC X_test = test_df[FEATURES]
+-- MAGIC y_test = test_df[TARGET]
+-- MAGIC
+-- MAGIC print("Train rows:", len(train_df))
+-- MAGIC print("Test rows:", len(test_df))
+-- MAGIC print("Train churn rate:", round(y_train.mean(), 3))
+-- MAGIC print("Test churn rate:", round(y_test.mean(), 3))
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 3. Definir los candidatos
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC def make_pipeline(classifier):
+-- MAGIC     preprocessor = ColumnTransformer([
+-- MAGIC         (
+-- MAGIC             "numeric",
+-- MAGIC             Pipeline([
+-- MAGIC                 ("imputer", SimpleImputer(strategy="median")),
+-- MAGIC                 ("scaler", StandardScaler()),
+-- MAGIC             ]),
+-- MAGIC             NUMERIC,
+-- MAGIC         ),
+-- MAGIC         (
+-- MAGIC             "categorical",
+-- MAGIC             Pipeline([
+-- MAGIC                 ("imputer", SimpleImputer(strategy="most_frequent")),
+-- MAGIC                 ("onehot", OneHotEncoder(handle_unknown="ignore")),
+-- MAGIC             ]),
+-- MAGIC             CATEGORICAL,
+-- MAGIC         ),
+-- MAGIC     ])
+-- MAGIC
+-- MAGIC     return Pipeline([
+-- MAGIC         ("preprocessor", preprocessor),
+-- MAGIC         ("classifier", classifier),
+-- MAGIC     ])
+-- MAGIC
+-- MAGIC
+-- MAGIC candidates = {
+-- MAGIC     "logistic_regression": LogisticRegression(
+-- MAGIC         max_iter=1000,
+-- MAGIC         class_weight="balanced",
+-- MAGIC     ),
+-- MAGIC     "random_forest": RandomForestClassifier(
+-- MAGIC         n_estimators=180,
+-- MAGIC         max_depth=8,
+-- MAGIC         min_samples_leaf=5,
+-- MAGIC         class_weight="balanced",
+-- MAGIC         random_state=TRAIN_SEED,
+-- MAGIC         n_jobs=2,
+-- MAGIC     ),
+-- MAGIC }
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 4. Evaluar la versión actual sobre el mismo test
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC mlflow.set_registry_uri("databricks-uc")
+-- MAGIC
+-- MAGIC incumbent_uri = (
+-- MAGIC     f"models:/{MODEL_NAME}/{INCUMBENT_VERSION}"
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("\nLoading incumbent:", incumbent_uri)
+-- MAGIC
+-- MAGIC incumbent_model = mlflow.sklearn.load_model(
+-- MAGIC     incumbent_uri
+-- MAGIC )
+-- MAGIC
+-- MAGIC incumbent_prob = incumbent_model.predict_proba(X_test)[:, 1]
+-- MAGIC incumbent_pred = incumbent_model.predict(X_test)
+-- MAGIC
+-- MAGIC incumbent_metrics = {
+-- MAGIC     "roc_auc": float(
+-- MAGIC         roc_auc_score(y_test, incumbent_prob)
+-- MAGIC     ),
+-- MAGIC     "f1": float(
+-- MAGIC         f1_score(y_test, incumbent_pred, zero_division=0)
+-- MAGIC     ),
+-- MAGIC     "accuracy": float(
+-- MAGIC         accuracy_score(y_test, incumbent_pred)
+-- MAGIC     ),
+-- MAGIC }
+-- MAGIC
+-- MAGIC print("\nINCUMBENT MODEL — VERSION 1")
+-- MAGIC print(incumbent_metrics)
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 5. Entrenar y evaluar candidatos con MLflow tracking
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC candidate_results = []
+-- MAGIC candidate_models = {}
+-- MAGIC candidate_uris = {}
+-- MAGIC
+-- MAGIC for model_name, classifier in candidates.items():
+-- MAGIC
+-- MAGIC     model = make_pipeline(classifier)
+-- MAGIC     model.fit(X_train, y_train)
+-- MAGIC
+-- MAGIC     prob = model.predict_proba(X_test)[:, 1]
+-- MAGIC     pred = model.predict(X_test)
+-- MAGIC
+-- MAGIC     metrics = {
+-- MAGIC         "roc_auc": float(roc_auc_score(y_test, prob)),
+-- MAGIC         "f1": float(
+-- MAGIC             f1_score(y_test, pred, zero_division=0)
+-- MAGIC         ),
+-- MAGIC         "accuracy": float(
+-- MAGIC             accuracy_score(y_test, pred)
+-- MAGIC         ),
+-- MAGIC     }
+-- MAGIC
+-- MAGIC     signature = infer_signature(
+-- MAGIC         X_train.head(5),
+-- MAGIC         model.predict(X_train.head(5)),
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     with mlflow.start_run(
+-- MAGIC         run_name=f"retraining_candidate_{model_name}"
+-- MAGIC     ) as run:
+-- MAGIC
+-- MAGIC         mlflow.log_params({
+-- MAGIC             "model_type": model_name,
+-- MAGIC             "train_seed": TRAIN_SEED,
+-- MAGIC             "test_seed": TEST_SEED,
+-- MAGIC             "train_rows": len(train_df),
+-- MAGIC             "test_rows": len(test_df),
+-- MAGIC             "synthetic_distribution": "shifted",
+-- MAGIC         })
+-- MAGIC
+-- MAGIC         mlflow.log_metrics(metrics)
+-- MAGIC
+-- MAGIC         mlflow.set_tags({
+-- MAGIC             "purpose": "controlled_retraining_demo",
+-- MAGIC             "data_type": "synthetic",
+-- MAGIC             "candidate_status": "pending_evaluation",
+-- MAGIC         })
+-- MAGIC
+-- MAGIC         model_info = mlflow.sklearn.log_model(
+-- MAGIC             sk_model=model,
+-- MAGIC             artifact_path="model",
+-- MAGIC             signature=signature,
+-- MAGIC             input_example=X_train.head(5),
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         candidate_results.append({
+-- MAGIC             "model_type": model_name,
+-- MAGIC             "run_id": run.info.run_id,
+-- MAGIC             **metrics,
+-- MAGIC         })
+-- MAGIC
+-- MAGIC         candidate_models[model_name] = model
+-- MAGIC         candidate_uris[model_name] = model_info.model_uri
+-- MAGIC
+-- MAGIC
+-- MAGIC results_df = pd.DataFrame(candidate_results).sort_values(
+-- MAGIC     "roc_auc", ascending=False
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(results_df)
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 6. Regla de aceptación
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC best = results_df.iloc[0]
+-- MAGIC
+-- MAGIC best_name = str(best["model_type"])
+-- MAGIC best_auc = float(best["roc_auc"])
+-- MAGIC best_f1 = float(best["f1"])
+-- MAGIC
+-- MAGIC # Criterios configurables de demostración:
+-- MAGIC MIN_AUC_GAIN = 0.005
+-- MAGIC MAX_F1_DEGRADATION = 0.02
+-- MAGIC
+-- MAGIC auc_pass = (
+-- MAGIC     best_auc >= incumbent_metrics["roc_auc"] + MIN_AUC_GAIN
+-- MAGIC )
+-- MAGIC
+-- MAGIC f1_pass = (
+-- MAGIC     best_f1 >= incumbent_metrics["f1"] - MAX_F1_DEGRADATION
+-- MAGIC )
+-- MAGIC
+-- MAGIC accepted = auc_pass and f1_pass
+-- MAGIC
+-- MAGIC print("\nINCUMBENT ROC-AUC:", incumbent_metrics["roc_auc"])
+-- MAGIC print("CANDIDATE ROC-AUC:", best_auc)
+-- MAGIC print("INCUMBENT F1:", incumbent_metrics["f1"])
+-- MAGIC print("CANDIDATE F1:", best_f1)
+-- MAGIC print("AUC gate passed:", auc_pass)
+-- MAGIC print("F1 gate passed:", f1_pass)
+-- MAGIC print("FINAL DECISION:", "ACCEPT" if accepted else "REJECT")
+-- MAGIC
+-- MAGIC
+-- MAGIC # =========================================================
+-- MAGIC # 7. Registrar una nueva versión solamente si pasa
+-- MAGIC # =========================================================
+-- MAGIC
+-- MAGIC if accepted:
+-- MAGIC
+-- MAGIC     registered_version = mlflow.register_model(
+-- MAGIC         model_uri=candidate_uris[best_name],
+-- MAGIC         name=MODEL_NAME,
+-- MAGIC         await_registration_for=300,
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     print("\nCANDIDATE ACCEPTED")
+-- MAGIC     print("Candidate model:", best_name)
+-- MAGIC     print("Registered model:", registered_version.name)
+-- MAGIC     print("New version:", registered_version.version)
+-- MAGIC     print("Registry status:", registered_version.status)
+-- MAGIC
+-- MAGIC     print(
+-- MAGIC         "\nIMPORTANT: The existing serving endpoint was not modified. "
+-- MAGIC         "The new version requires separate validation before deployment."
+-- MAGIC     )
+-- MAGIC
+-- MAGIC else:
+-- MAGIC     print("\nCANDIDATE REJECTED")
+-- MAGIC     print(
+-- MAGIC         "The existing version 1 remains registered. "
+-- MAGIC         "No new registered version was created."
+-- MAGIC     )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from mlflow.tracking import MlflowClient
+-- MAGIC
+-- MAGIC client = MlflowClient()
+-- MAGIC
+-- MAGIC for result in candidate_results:
+-- MAGIC     auc_ok = (
+-- MAGIC         result["roc_auc"]
+-- MAGIC         >= incumbent_metrics["roc_auc"] + MIN_AUC_GAIN
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     f1_ok = (
+-- MAGIC         result["f1"]
+-- MAGIC         >= incumbent_metrics["f1"] - MAX_F1_DEGRADATION
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     accepted_candidate = auc_ok and f1_ok
+-- MAGIC
+-- MAGIC     reasons = []
+-- MAGIC
+-- MAGIC     if not auc_ok:
+-- MAGIC         reasons.append("insufficient_roc_auc_gain")
+-- MAGIC
+-- MAGIC     if not f1_ok:
+-- MAGIC         reasons.append("excessive_f1_degradation")
+-- MAGIC
+-- MAGIC     status = "accepted" if accepted_candidate else "rejected"
+-- MAGIC
+-- MAGIC     client.set_tag(
+-- MAGIC         result["run_id"], "candidate_status", status
+-- MAGIC     )
+-- MAGIC     client.set_tag(
+-- MAGIC         result["run_id"], "gate_auc_pass", str(auc_ok).lower()
+-- MAGIC     )
+-- MAGIC     client.set_tag(
+-- MAGIC         result["run_id"], "gate_f1_pass", str(f1_ok).lower()
+-- MAGIC     )
+-- MAGIC     client.set_tag(
+-- MAGIC         result["run_id"],
+-- MAGIC         "gate_reason",
+-- MAGIC         "passed_all_gates" if not reasons else ",".join(reasons)
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     print(
+-- MAGIC         f'{result["model_type"]}: {status} | '
+-- MAGIC         f'ROC-AUC={result["roc_auc"]:.4f} | '
+-- MAGIC         f'F1={result["f1"]:.4f} | '
+-- MAGIC         f'Reason={",".join(reasons) if reasons else "passed_all_gates"}'
+-- MAGIC     )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from mlflow.tracking import MlflowClient
+-- MAGIC
+-- MAGIC client = MlflowClient()
+-- MAGIC
+-- MAGIC # Métricas del modelo vigente, versión 1
+-- MAGIC incumbent_auc = 0.8017079488591784
+-- MAGIC incumbent_f1 = 0.8061085355876738
+-- MAGIC
+-- MAGIC MIN_AUC_GAIN = 0.005
+-- MAGIC MAX_F1_DEGRADATION = 0.02
+-- MAGIC
+-- MAGIC pending_runs = []
+-- MAGIC
+-- MAGIC for exp in client.search_experiments():
+-- MAGIC     runs = client.search_runs(
+-- MAGIC         experiment_ids=[exp.experiment_id],
+-- MAGIC         filter_string=(
+-- MAGIC             "tags.purpose = 'controlled_retraining_demo' "
+-- MAGIC             "and tags.candidate_status = 'pending_evaluation'"
+-- MAGIC         ),
+-- MAGIC         max_results=100,
+-- MAGIC         order_by=["attributes.start_time DESC"],
+-- MAGIC     )
+-- MAGIC     pending_runs.extend(runs)
+-- MAGIC
+-- MAGIC if not pending_runs:
+-- MAGIC     print("No se encontraron candidatos pendientes de etiquetar.")
+-- MAGIC
+-- MAGIC for run in pending_runs:
+-- MAGIC     metrics = run.data.metrics
+-- MAGIC
+-- MAGIC     auc = metrics.get("roc_auc")
+-- MAGIC     f1 = metrics.get("f1")
+-- MAGIC
+-- MAGIC     if auc is None or f1 is None:
+-- MAGIC         print("Sin métricas suficientes:", run.info.run_id)
+-- MAGIC         continue
+-- MAGIC
+-- MAGIC     auc_ok = auc >= incumbent_auc + MIN_AUC_GAIN
+-- MAGIC     f1_ok = f1 >= incumbent_f1 - MAX_F1_DEGRADATION
+-- MAGIC     accepted = auc_ok and f1_ok
+-- MAGIC
+-- MAGIC     client.set_tag(
+-- MAGIC         run.info.run_id,
+-- MAGIC         "candidate_status",
+-- MAGIC         "accepted" if accepted else "rejected",
+-- MAGIC     )
+-- MAGIC     client.set_tag(run.info.run_id, "gate_auc_pass", str(auc_ok).lower())
+-- MAGIC     client.set_tag(run.info.run_id, "gate_f1_pass", str(f1_ok).lower())
+-- MAGIC
+-- MAGIC     reasons = []
+-- MAGIC     if not auc_ok:
+-- MAGIC         reasons.append("insufficient_roc_auc_gain")
+-- MAGIC     if not f1_ok:
+-- MAGIC         reasons.append("excessive_f1_degradation")
+-- MAGIC
+-- MAGIC     client.set_tag(
+-- MAGIC         run.info.run_id,
+-- MAGIC         "gate_reason",
+-- MAGIC         "passed_all_gates" if accepted else ",".join(reasons),
+-- MAGIC     )
+-- MAGIC
+-- MAGIC     print(
+-- MAGIC         f"{run.data.params.get('model_type', 'candidate')}: "
+-- MAGIC         f"{'ACCEPT' if accepted else 'REJECT'} | "
+-- MAGIC         f"AUC={auc:.4f} | F1={f1:.4f} | "
+-- MAGIC         f"Reason={','.join(reasons) if reasons else 'passed_all_gates'}"
+-- MAGIC     )
